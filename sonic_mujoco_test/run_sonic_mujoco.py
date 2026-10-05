@@ -2,7 +2,7 @@
 
 Physics matches gear_sonic/scripts/run_sim_loop.py (scene_43dof.xml, 200 Hz, PD torques
 from the deploy's kp/kd, effort-limit clipping, elastic band); the controller is the Python
-port of the C++ deploy loop in sonic_deploy_py.py.
+port of the C++ deploy loop in sonic_deploy_py.py (SONIC v1.1, with its ankle pitch gains).
 
 Usage (from repo root):
     source sonic_mujoco_test/cache_env.sh && source .venv_sim/bin/activate
@@ -26,6 +26,7 @@ from sonic_deploy_py import (
     IDLE,
     KDS,
     KPS,
+    POLICY_DIR,
     SLOW_WALK,
     WALK,
     MovementState,
@@ -39,7 +40,6 @@ from sonic_deploy_py import (
 
 REPO = Path(__file__).resolve().parent.parent
 SCENE = REPO / "gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml"
-POLICY_DIR = REPO / "gear_sonic_deploy/policy/release"
 PLANNER = REPO / "gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx"
 
 SIM_DT = 0.005          # SIMULATE_DT in g1_29dof_sonic_model12.yaml

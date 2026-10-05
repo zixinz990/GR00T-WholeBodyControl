@@ -187,7 +187,7 @@ def main():
 
     qpos = np.array(qpos)
     meta = dict(
-        controller="C1 SONIC (gear_sonic_deploy release model, Python port sonic_deploy_py.py)",
+        controller="C1 SONIC (gear_sonic_deploy SONIC v1.1 model, Python port sonic_deploy_py.py)",
         sim_dt=SIM_DT, control_dt=CONTROL_DT, decimation=DECIMATION, physics_timestep_in_model=float(sim.m.opt.timestep),
         input_mode="planner IDLE (g1 encoder mode 0) + C++ upper-body override (PLANNER_FROZEN_UPPER_BODY)",
         commands=dict(planner=dict(mode="IDLE", movement=[0, 0, 0], facing=[1, 0, 0], speed=-1.0, height=-1.0),

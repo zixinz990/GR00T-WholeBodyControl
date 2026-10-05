@@ -1,19 +1,25 @@
 """Python / onnxruntime port of the SONIC C++ deployment loop (gear_sonic_deploy).
 
 Mirrors the logic of src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp for the
-default release model (policy/release/*) and the V2 kinematic planner:
+SONIC v1.1 model (policy/sonic_v1_1/*, observation_config.yaml of that directory) and the
+V2 kinematic planner:
 
-  * observation registry / gatherers (decoder + encoder, mode filter g1 / teleop)
+  * observation registry / gatherers (decoder + encoder, mode filter g1 / teleop); v1.1
+    uses the robot-heading-normalized anchor orientations (orientation_mode 1 of
+    GatherMotionAnchorOrientationMutiFrame) and has no root z observations
   * StateLogger history semantics (oldest-first, zero padding)
   * heading handling (init_base_quat, init_ref_data_root_rot, apply_delta_heading)
   * LocalMotionPlannerBase (context resampling, 30 Hz -> 50 Hz resampling, blending,
     replan triggers, idle re-adaptation)
-  * action -> PD target mapping (kps / kds / action scale / default angles)
+  * action -> PD target mapping (kps / kds / action scale / default angles), with the
+    v1.1 motor gain scaling of the ankle pitch motors (deploy.sh --motor-kp-scale 4,10=1.5
+    --motor-kd-scale 4,10=1.5, docs/source/getting_started/download_models.md)
 
 The ONNX models are the exact files the C++ stack feeds to TensorRT.
 """
 
 import math
+from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
@@ -58,6 +64,13 @@ for _i in (4, 5, 10, 11, 13, 14):
 # kps / kds are std::array<float, 29> in C++
 KPS = KPS.astype(np.float32).astype(np.float64)
 KDS = KDS.astype(np.float32).astype(np.float64)
+# SONIC v1.1 motor gain scaling (motor_gain_scaling.cpp, MotorCommand gains are float): the
+# left and right ankle pitch motors (hardware indices 4 and 10) use 1.5x Kp and Kd. The action
+# scale keeps the unscaled gains.
+MOTOR_GAIN_SCALE = {4: 1.5, 10: 1.5}
+for _i, _s in MOTOR_GAIN_SCALE.items():
+    KPS[_i] = float(np.float32(KPS[_i]) * np.float32(_s))
+    KDS[_i] = float(np.float32(KDS[_i]) * np.float32(_s))
 
 DEFAULT_ANGLES = np.array([
     -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,
@@ -76,6 +89,31 @@ MUJOCO_TO_ISAACLAB = np.array([0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10
 LOWER_BODY_MJ_ORDER_IN_IL = [0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18]
 LOWER_BODY_IL_ORDER_IN_IL = [0, 1, 3, 4, 6, 7, 9, 10, 13, 14, 17, 18]
 WRIST_IL_ORDER_IN_IL = [23, 24, 25, 26, 27, 28]
+
+POLICY_DIR = Path(__file__).resolve().parent.parent / "gear_sonic_deploy/policy/sonic_v1_1"
+
+# Encoder input layout: encoder_observations of policy/sonic_v1_1/observation_config.yaml, in
+# order, with the dimensions of the C++ observation registry (encoder input 1751).
+ENCODER_OBS = [
+    ("encoder_mode_4", 4),
+    ("motion_joint_positions_10frame_step5", 290),
+    ("motion_joint_velocities_10frame_step5", 290),
+    ("motion_anchor_orientation_heading_10frame_step5", 60),
+    ("motion_anchor_orientation_heading", 6),
+    ("motion_joint_positions_lowerbody_10frame_step5", 120),
+    ("motion_joint_velocities_lowerbody_10frame_step5", 120),
+    ("vr_3point_local_target", 9),
+    ("vr_3point_local_orn_target", 12),
+    ("smpl_joints_10frame_step1", 720),
+    ("smpl_anchor_orientation_heading_10frame_step1", 60),
+    ("motion_joint_positions_wrists_10frame_step1", 60),
+]
+ENC = {}
+ENC_DIM = 0
+for _name, _dim in ENCODER_OBS:
+    ENC[_name] = slice(ENC_DIM, ENC_DIM + _dim)
+    ENC_DIM += _dim
+DEC_DIM = 994
 
 # LocomotionMode (localmotion_kplanner.hpp)
 IDLE, SLOW_WALK, WALK, RUN = 0, 1, 2, 3
@@ -339,7 +377,7 @@ class SonicDeploy:
         self.planner = KinematicPlanner(planner_path, providers, so)
         self.enc_dim = self.encoder.get_inputs()[0].shape[1]
         self.dec_dim = self.decoder.get_inputs()[0].shape[1]
-        assert self.enc_dim == 1762 and self.dec_dim == 994
+        assert self.enc_dim == ENC_DIM and self.dec_dim == DEC_DIM, "not the SONIC v1.1 encoder / decoder"
 
         self.planner_motion = MotionSequence("planner_motion")
         self.current_motion = None
@@ -506,13 +544,14 @@ class SonicDeploy:
         return np.concatenate(out)
 
     def g_anchor_ori(self, num_frames, step):
+        """Anchor orientation relative to the robot heading (orientation_mode 1)."""
         m = self.current_motion
-        base_quat = self.history[-1]["base_quat"]
+        robot_heading = calc_heading_quat(self.history[-1]["base_quat"])
         adh = self.apply_delta_heading()
         out = []
         for f in self._target_frames(num_frames, step):
             ref = quat_mul(adh, m.root_quat[f])
-            r = quat_to_rotmat(quat_mul(quat_conj(base_quat), ref))
+            r = quat_to_rotmat(quat_mul(quat_conj(robot_heading), ref))
             out.append(r[:, :2].reshape(-1))
         return np.concatenate(out)
 
@@ -523,15 +562,16 @@ class SonicDeploy:
         mode = m.encode_mode
         buf[0] = float(mode)
         if mode == 0:  # g1
-            buf[4:294] = self.g_joint_pos(10, 5)
-            buf[294:584] = self.g_joint_vel(10, 5)
-            buf[601:661] = self.g_anchor_ori(10, 5)
+            buf[ENC["motion_joint_positions_10frame_step5"]] = self.g_joint_pos(10, 5)
+            buf[ENC["motion_joint_velocities_10frame_step5"]] = self.g_joint_vel(10, 5)
+            buf[ENC["motion_anchor_orientation_heading_10frame_step5"]] = self.g_anchor_ori(10, 5)
         elif mode == 1:  # teleop
-            buf[595:601] = self.g_anchor_ori(1, 1)
-            buf[661:781] = self.g_joint_pos(10, 5, LOWER_BODY_MJ_ORDER_IN_IL)
-            buf[781:901] = self.g_joint_vel(10, 5, LOWER_BODY_MJ_ORDER_IN_IL)
-            buf[901:910] = self.vr3_pos
-            buf[910:922] = self.vr3_orn
+            buf[ENC["motion_anchor_orientation_heading"]] = self.g_anchor_ori(1, 1)
+            lower = LOWER_BODY_MJ_ORDER_IN_IL
+            buf[ENC["motion_joint_positions_lowerbody_10frame_step5"]] = self.g_joint_pos(10, 5, lower)
+            buf[ENC["motion_joint_velocities_lowerbody_10frame_step5"]] = self.g_joint_vel(10, 5, lower)
+            buf[ENC["vr_3point_local_target"]] = self.vr3_pos
+            buf[ENC["vr_3point_local_orn_target"]] = self.vr3_orn
         else:
             raise NotImplementedError("smpl mode not used here")
         return buf
